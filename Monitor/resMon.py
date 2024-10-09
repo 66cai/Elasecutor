@@ -1,42 +1,43 @@
-#resource monitor
+# -*- coding: utf-8 -*-
 import argparse
 import os
 import sched
 import sys
 import time
 import psutil
+from collections import defaultdict
 
 
-class resMonitor:
-    #using resprofile as the profile file
+# 定义资源监控器类
+class ResMonitor:
     def __init__(self, outfile_name=None, flush=False):
         print('Resource monitor started.', file=sys.stderr)
-        ncores = self.ncores = psutil.cpu_count()
-        if outfile_name is None:
-            self.outfile = sys.stdout
-        else:
-            self.outfile = open(outfile_name, 'w')
+        self.ncores = psutil.cpu_count()  # 获取 CPU 核心数
+        self.outfile = open(outfile_name, 'w') if outfile_name else sys.stdout
         self.flush = flush
-        self.outfile.write(
-            'Timestamp,  Uptime, NCPU, %CPU, ' + ', '.join(['%CPU' + str(i) for i in range(ncores)]) +
-            ', %MEM, mem.total.KB, mem.used.KB, mem.avail.KB, mem.free.KB' +
-            ', %SWAP, swap.total.KB, swap.used.KB, swap.free.KB' +
-            ', io.read, io.write, io.read.KB, io.write.KB, io.read.ms, io.write.ms\n')
         self.prev_disk_stat = psutil.disk_io_counters()
         self.starttime = int(time.time())
-        self.poll_stat()
+        self._write_header()  # 写入文件标题
+
+    def _write_header(self):
+        header = (
+            'Timestamp, Uptime, NCPU, %CPU, '
+            + ', '.join([f'%CPU{i}' for i in range(self.ncores)]) +
+            ', %MEM, mem.total.MB, mem.used.MB, mem.avail.MB, mem.free.MB' +
+            ', %SWAP, swap.total.MB, swap.used.MB, swap.free.MB' +
+            ', io.read, io.write, io.read.MB, io.write.MB, io.read.ms, io.write.ms\n'
+        )
+        self.outfile.write(header)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if not hasattr(self, 'closed'):
-            self.close()
+        self.close()
 
     def close(self):
         if self.outfile is not sys.stdout:
             self.outfile.close()
-        self.closed = True
         print('Resource monitor closed.', file=sys.stderr)
 
     def poll_stat(self):
@@ -48,17 +49,19 @@ class resMonitor:
         swap_stat = psutil.swap_memory()
         disk_stat = psutil.disk_io_counters()
 
-        line = str(timestamp) + ', ' + str(uptime) + ', ' + \
-            str(self.ncores) + ', ' + str(total_cpu_percent*self.ncores) + ', '
-        line += ', '.join([str(i) for i in percpu_percent])
-        line += ', ' + str(mem_stat.percent) + ', ' + str(mem_stat.total >> 10) + ', ' + str(
-            mem_stat.used >> 10) + ', ' + str(mem_stat.available >> 10) + ', ' + str(mem_stat.free >> 10)
-        line += ', ' + str(swap_stat.percent) + ', ' + str(swap_stat.total >> 10) + \
-            ', ' + str(swap_stat.used >> 10) + ', ' + str(swap_stat.free >> 10)
-        line += ', ' + str(disk_stat.read_count - self.prev_disk_stat.read_count) + ', ' + str(disk_stat.write_count - self.prev_disk_stat.write_count) + \
-                ', ' + str((disk_stat.read_bytes - self.prev_disk_stat.read_bytes) >> 10) + ', ' + str((disk_stat.write_bytes - self.prev_disk_stat.write_bytes) >> 10) + \
-                ', ' + str(disk_stat.read_time - self.prev_disk_stat.read_time) + \
-            ', ' + str(disk_stat.write_time - self.prev_disk_stat.write_time)
+        line = (
+            f"{timestamp}, {uptime}, {self.ncores}, {total_cpu_percent * self.ncores}, "
+            + ', '.join(map(str, percpu_percent)) +
+            f", {mem_stat.percent}, {mem_stat.total >> 20}, {mem_stat.used >> 20}, "
+            f"{mem_stat.available >> 20}, {mem_stat.free >> 20}, "
+            f"{swap_stat.percent}, {swap_stat.total >> 20}, {swap_stat.used >> 20}, "
+            f"{swap_stat.free >> 20}, {disk_stat.read_count - self.prev_disk_stat.read_count}, "
+            f"{disk_stat.write_count - self.prev_disk_stat.write_count}, "
+            f"{(disk_stat.read_bytes - self.prev_disk_stat.read_bytes) >> 20}, "
+            f"{(disk_stat.write_bytes - self.prev_disk_stat.write_bytes) >> 20}, "
+            f"{disk_stat.read_time - self.prev_disk_stat.read_time}, "
+            f"{disk_stat.write_time - self.prev_disk_stat.write_time}"
+        )
 
         self.outfile.write(line + '\n')
         if self.flush:
@@ -66,89 +69,76 @@ class resMonitor:
         self.prev_disk_stat = disk_stat
 
 
+# 定义网络接口监控器类
 class NetworkInterfaceMonitor:
-
-    def __init__(self, outfile_pattern='netstat.{nic}.csv', nics=[], flush=False):
+    def __init__(self, outfile_pattern='netstat.{nic}.csv', nics=None, flush=False):
         print('NIC monitor started.', file=sys.stderr)
-        all_nics = psutil.net_if_stats()
-        self.nic_files = dict()
-        self.flush = flush
-        for nic_name in nics:
-            nic_name = nic_name.strip()
-            if nic_name not in all_nics:
-                print('Error: NIC "%s" does not exist. Skip.' %
-                      nic_name, file=sys.stderr)
-            else:
-                self.nic_files[nic_name] = self.create_new_logfile(
-                    outfile_pattern, nic_name)
-        if len(self.nic_files) == 0:
+        self.nic_files = {nic_name: self.create_new_logfile(outfile_pattern, nic_name)
+                          for nic_name in (nics or []) if nic_name in psutil.net_if_stats()}
+        if not self.nic_files:
             raise ValueError('No NIC to monitor.')
-        self.prev_stat = dict()
-        for nic, stat in psutil.net_io_counters(pernic=True).items():
-            if nic in self.nic_files:
-                self.prev_stat[nic] = stat
+        self.prev_stat = {nic: psutil.net_io_counters(pernic=True)[nic] for nic in self.nic_files}
         self.starttime = int(time.time())
-        self.poll_stat()
+        self.flush = flush
+        self.poll_stat()  # 初次轮询状态
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if not hasattr(self, 'closed'):
-            self.close()
+        self.close()
 
     def close(self):
         for f in self.nic_files.values():
             f.close()
-        self.closed = True
         print('NIC monitor closed.', file=sys.stderr)
 
     def create_new_logfile(self, pattern, nic_name):
         f = open(pattern.format(nic=nic_name), 'w')
-        f.write(
-            'Timestamp,  Uptime, NIC, sent.B, recv.B, sent.pkts, recv.pkts, err.in, err.out, drop.in, drop.out\n')
+        f.write('Timestamp, Uptime, NIC, sent.MB, recv.MB, sent.pkts, recv.pkts, err.in, err.out, drop.in, drop.out\n')
         return f
 
     def poll_stat(self):
         timestamp = int(time.time())
         uptime = timestamp - self.starttime
         net_stat = psutil.net_io_counters(pernic=True)
+
         for nic, f in self.nic_files.items():
-            stat = net_stat[nic]
+            curr_stat = net_stat[nic]
             prevstat = self.prev_stat[nic]
-            f.write(str(timestamp) + ', ' + str(uptime) + ', ' + nic + ', ' +
-                    str(stat.bytes_sent-prevstat.bytes_sent) + ', ' + str(stat.bytes_recv-prevstat.bytes_recv) + ', ' +
-                    str(stat.packets_sent-prevstat.packets_sent) + ', ' + str(stat.packets_recv-prevstat.packets_recv) + ', ' +
-                    str(stat.errin-prevstat.errin) + ', ' + str(stat.errout-prevstat.errout) + ', ' + str(stat.dropin-prevstat.dropin) + ', ' + str(stat.dropout-prevstat.dropout) + '\n')
+            f.write(f"{timestamp}, {uptime}, {nic}, "
+                    f"{(curr_stat.bytes_sent - prevstat.bytes_sent) >> 20}, "
+                    f"{(curr_stat.bytes_recv - prevstat.bytes_recv) >> 20}, "
+                    f"{curr_stat.packets_sent - prevstat.packets_sent}, "
+                    f"{curr_stat.packets_recv - prevstat.packets_recv}, "
+                    f"{curr_stat.errin - prevstat.errin}, "
+                    f"{curr_stat.errout - prevstat.errout}, "
+                    f"{curr_stat.dropin - prevstat.dropin}, "
+                    f"{curr_stat.dropout - prevstat.dropout}\n")
             if self.flush:
                 f.flush()
         self.prev_stat = net_stat
 
-#define the resource monitored
-class ProcessSetMonitor:
 
+# 定义进程集合监控器类
+class ProcessSetMonitor:
     BASE_STAT = {
         'io.read': 0,
         'io.write': 0,
-        'io.read.KB': 0,
-        'io.write.KB': 0,
-        'mem.rss.KB': 0,
+        'io.read.MB': 0,
+        'io.write.MB': 0,
+        'mem.rss.MB': 0,
         '%MEM': 0,
         '%CPU': 0,
     }
 
-    KEYS = sorted(BASE_STAT.keys())
-
     def __init__(self, keywords, pids, outfile_name, flush=False):
         print('ProcessSet monitor started.', file=sys.stderr)
-        if outfile_name is None:
-            self.outfile = sys.stdout
-        else:
-            self.outfile = open(outfile_name, 'w')
-        self.pids = pids
+        self.outfile = open(outfile_name, 'w') if outfile_name else sys.stdout
+        self.pids = set(pids)
         self.keywords = keywords
         self.flush = flush
-        self.outfile.write('Timestamp, Uptime, ' + ', '.join(self.KEYS) + '\n')
+        self.outfile.write('Timestamp, Uptime, ' + ', '.join(sorted(self.BASE_STAT.keys())) + '\n')
         self.starttime = int(time.time())
         self.poll_stat()
 
@@ -156,118 +146,114 @@ class ProcessSetMonitor:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if not hasattr(self, 'closed'):
-            self.close()
+        self.close()
 
     def close(self):
         if self.outfile is not sys.stdout:
             self.outfile.close()
-        self.closed = True
         print('ProcessSet monitor closed.', file=sys.stderr)
 
-    def _stat_proc(self, proc, stat, visited):
+    def _stat_proc(self, proc, visited):
         if proc.pid in visited:
             return
         visited.add(proc.pid)
-        io = proc.io_counters()
-        mem_rss = proc.memory_info().rss
-        mem_percent = proc.memory_percent('rss')
-        nctxsw = proc.num_ctx_switches()
-        nctxsw = nctxsw.voluntary + nctxsw.involuntary
-        nthreads = proc.num_threads()
-        cpu_percent = proc.cpu_percent()
-        stat['io.read'] += io.read_count
-        stat['io.write'] += io.write_count
-        stat['io.read.KB'] += io.read_bytes
-        stat['io.write.KB'] += io.write_bytes
-        stat['mem.rss.KB'] += mem_rss
-        stat['%MEM'] += mem_percent
-        stat['nctxsw'] += nctxsw
-        stat['%CPU'] += cpu_percent
-        for c in proc.children():
-            self._stat_proc(c, stat, visited)
+
+        try:
+            io = proc.io_counters()
+            mem_rss = proc.memory_info().rss
+            mem_percent = proc.memory_percent('rss')
+            cpu_percent = proc.cpu_percent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+
+        return {
+            'io.read': io.read_count,
+            'io.write': io.write_count,
+            'io.read.MB': io.read_bytes >> 20,  # 转换为MB
+            'io.write.MB': io.write_bytes >> 20,  # 转换为MB
+            'mem.rss.MB': mem_rss >> 20,  # 转换为MB
+            '%MEM': mem_percent,
+            '%CPU': cpu_percent,
+        }
 
     def poll_stat(self):
         visited = set()
-        curr_stat = dict(self.BASE_STAT)
+        curr_stat = defaultdict(int)
         timestamp = int(time.time())
         uptime = timestamp - self.starttime
-        for proc in psutil.process_iter():
+
+        for proc in psutil.process_iter(attrs=['pid', 'name']):
             try:
-                pinfo = proc.as_dict(attrs=['pid', 'name'])
-            except psutil.NoSuchProcess:
-                pass
-            else:
-                if pinfo['pid'] not in visited:
-                    if pinfo['pid'] in self.pids:
-                        self._stat_proc(proc, curr_stat, visited)
-                    else:
-                        for k in self.keywords:
-                            if k in pinfo['name'].lower():
-                                self._stat_proc(proc, curr_stat, visited)
-                                break  # for keyword
-        curr_stat['%CPU'] = round(curr_stat['%CPU'], 3)
-        curr_stat['%MEM'] = round(curr_stat['%MEM'], 3)
-        curr_stat['io.read.KB'] >>= 10
-        curr_stat['io.write.KB'] >>= 10
-        curr_stat['mem.rss.KB'] >>= 10
-        line = str(timestamp) + ', ' + str(uptime) + ', ' + \
-            ', '.join([str(curr_stat[k]) for k in self.KEYS]) + '\n'
-        self.outfile.write(line)
+                pinfo = proc.info
+                if pinfo['pid'] in self.pids or any(k in pinfo['name'].lower() for k in self.keywords):
+                    proc_stat = self._stat_proc(proc, visited)
+                    if proc_stat:
+                        for key, value in proc_stat.items():
+                            curr_stat[key] += value
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        line = f"{timestamp}, {uptime}, " + ', '.join(str(curr_stat[k]) for k in sorted(self.BASE_STAT.keys()))
+        self.outfile.write(line + '\n')
         if self.flush:
             self.outfile.flush()
 
 
-#def chprio(prio):
-#    try:
-#        psutil.Process(os.getpid()).nice(prio)
-#    except:
-#        print('Warning: failed to elevate priority!', file=sys.stderr)
+# 更改进程优先级
+def chprio(prio):
+    try:
+        psutil.Process(os.getpid()).nice(prio)
+    except Exception:
+        print('Warning: failed to elevate priority!', file=sys.stderr)
 
 
-#def sigterm(signum, frame):
-#    raise KeyboardInterrupt()
+# 信号处理函数
+def sigterm(signum, frame):
+    raise KeyboardInterrupt()
 
 
+# 主函数，处理命令行参数并执行监控任务
 def main():
-    parser = argparse.ArgumentParser(
-    #transfer the pids got here
-    parser.add_argument('--ps-pids', type=int, nargs='*',
-                        help='Include the specified PIDs and their children.')
-    parser.add_argument('--ps-outfile', type=str, nargs='?', default='resprofile.csv')
+    parser = argparse.ArgumentParser(description="Resource Monitor")
+    parser.add_argument('--ps-pids', type=int, nargs='*', help='Include the specified PIDs and their children.')
+    parser.add_argument('--ps-outfile', type=str, default='resprofile.csv')
+    parser.add_argument('--nic', type=str, nargs='*', help='Network interface names to monitor.')
+    parser.add_argument('--outfile', type=str, help='Output file for resource monitor.')
+    parser.add_argument('--flush', action='store_true', help='Flush output after each line.')
+    parser.add_argument('--delay', type=int, default=5, help='Delay in seconds between each poll.')
     args = parser.parse_args()
-    #monitor the dedicated pid
-    if args.ps_pids is None:
-        args.ps_pids = set()
-    else:
-        args.ps_pids = set(args.ps_pids)
+
+    args.ps_pids = set(args.ps_pids) if args.ps_pids else set()
 
     try:
-        chprio(-20)
+        chprio(-20)  # 设置进程优先级
         scheduler = sched.scheduler(time.time, time.sleep)
-        sm = resMonitor(args.outfile, args.flush)
 
+        rm = ResMonitor(args.outfile, args.flush)
         enable_nic_mon = args.nic is not None
- 
-        if args.enable_ps:
-            pm = ProcessSetMonitor(
-                args.ps_keywords, args.ps_pids, args.ps_outfile, args.flush)
+        nm = NetworkInterfaceMonitor(nics=args.nic, flush=args.flush) if enable_nic_mon else None
+        enable_ps_mon = len(args.ps_pids) > 0
+        pm = ProcessSetMonitor([], args.ps_pids, args.ps_outfile, args.flush) if enable_ps_mon else None
 
         i = 1
         starttime = time.time()
         while True:
-            scheduler.enterabs(
-                time=starttime + i*args.delay, priority=2, action=resMonitor.poll_stat, argument=(sm, ))
+            scheduler.enterabs(starttime + i * args.delay, priority=2, action=ResMonitor.poll_stat, argument=(rm,))
             if enable_nic_mon:
-                scheduler.enterabs(time=starttime + i*args.delay, priority=1,
-                                   action=NetworkInterfaceMonitor.poll_stat, argument=(nm, ))
-            if args.enable_ps:
-                scheduler.enterabs(
-                    time=starttime + i*args.delay, priority=0, action=ProcessSetMonitor.poll_stat, argument=(pm, ))
+                scheduler.enterabs(starttime + i * args.delay, priority=1, action=NetworkInterfaceMonitor.poll_stat, argument=(nm,))
+            if enable_ps_mon:
+                scheduler.enterabs(starttime + i * args.delay, priority=0, action=ProcessSetMonitor.poll_stat, argument=(pm,))
             scheduler.run()
             i += 1
-        sys.exit(0)
+    except KeyboardInterrupt:
+        print("Monitoring interrupted. Exiting.")
+    finally:
+        rm.close()
+        if enable_nic_mon:
+            nm.close()
+        if enable_ps_mon:
+            pm.close()
 
 
 if __name__ == '__main__':
-    main()
+    main()  # 执行主程序

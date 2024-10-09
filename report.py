@@ -2,7 +2,7 @@ from xmlrpclib import ServerProxy, Fault
 from cmd import Cmd
 from random import choice
 from string import lowercase
-from server import Node,UNHANDLED  
+from server import Node,UNHANDLED
 from threading import Thread
 from time import sleep
 import sys
